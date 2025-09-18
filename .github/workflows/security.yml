@@ -1,0 +1,298 @@
+name: Security Scan
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM UTC
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'python' ]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: ${{ matrix.language }}
+        queries: security-extended,security-and-quality
+    
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v2
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+      with:
+        category: "/language:${{matrix.language}}"
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Install Python dependencies
+      run: |
+        cd backend
+        pip install safety pip-audit
+    
+    - name: Python security scan with Safety
+      run: |
+        cd backend
+        safety check -r requirements.txt --json --output safety-report.json || true
+        if [ -f safety-report.json ]; then
+          cat safety-report.json
+        fi
+    
+    - name: Python security scan with pip-audit
+      run: |
+        cd backend
+        pip-audit -r requirements.txt --format=json --output=pip-audit-report.json || true
+        if [ -f pip-audit-report.json ]; then
+          cat pip-audit-report.json
+        fi
+    
+    - name: Install Node.js dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Node.js security scan
+      run: |
+        cd frontend
+        npm audit --audit-level=moderate --json > npm-audit-report.json || true
+        if [ -f npm-audit-report.json ]; then
+          cat npm-audit-report.json
+        fi
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: |
+          backend/safety-report.json
+          backend/pip-audit-report.json
+          frontend/npm-audit-report.json
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Build backend image
+      run: |
+        cd backend
+        docker build -t ecobench-backend:test .
+    
+    - name: Build frontend image
+      run: |
+        cd frontend
+        docker build -t ecobench-frontend:test .
+    
+    - name: Scan backend image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'ecobench-backend:test'
+        format: 'sarif'
+        output: 'backend-trivy-results.sarif'
+    
+    - name: Scan frontend image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'ecobench-frontend:test'
+        format: 'sarif'
+        output: 'frontend-trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'backend-trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'frontend-trivy-results.sarif'
+
+  secrets-scan:
+    name: Secrets Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: TruffleHog OSS
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+        extra_args: --debug --only-verified
+
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Install license checkers
+      run: |
+        pip install pip-licenses
+        npm install -g license-checker
+    
+    - name: Check Python licenses
+      run: |
+        cd backend
+        pip install -r requirements.txt
+        pip-licenses --format=json --output-file=python-licenses.json
+        pip-licenses --format=plain-vertical
+    
+    - name: Check Node.js licenses
+      run: |
+        cd frontend
+        npm ci
+        license-checker --json --out npm-licenses.json
+        license-checker --summary
+    
+    - name: Upload license reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: license-reports
+        path: |
+          backend/python-licenses.json
+          frontend/npm-licenses.json
+
+  security-policy-check:
+    name: Security Policy Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check for security policy
+      run: |
+        if [ ! -f SECURITY.md ]; then
+          echo "⚠️ SECURITY.md file not found"
+          echo "Consider adding a security policy to help users report vulnerabilities"
+          exit 1
+        else
+          echo "✅ Security policy found"
+        fi
+    
+    - name: Check for dependabot config
+      run: |
+        if [ ! -f .github/dependabot.yml ]; then
+          echo "⚠️ Dependabot configuration not found"
+          echo "Consider enabling automated dependency updates"
+        else
+          echo "✅ Dependabot configuration found"
+        fi
+
+  security-report:
+    name: Security Report
+    runs-on: ubuntu-latest
+    needs: [codeql-analysis, dependency-scan, container-scan, secrets-scan, license-check]
+    if: always()
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: security-artifacts
+    
+    - name: Generate security summary
+      run: |
+        echo "# Security Scan Summary" > security-summary.md
+        echo "" >> security-summary.md
+        echo "## Scan Results" >> security-summary.md
+        echo "" >> security-summary.md
+        
+        if [ "${{ needs.codeql-analysis.result }}" == "success" ]; then
+          echo "✅ CodeQL Analysis: Passed" >> security-summary.md
+        else
+          echo "❌ CodeQL Analysis: Failed" >> security-summary.md
+        fi
+        
+        if [ "${{ needs.dependency-scan.result }}" == "success" ]; then
+          echo "✅ Dependency Scan: Passed" >> security-summary.md
+        else
+          echo "❌ Dependency Scan: Failed" >> security-summary.md
+        fi
+        
+        if [ "${{ needs.container-scan.result }}" == "success" ]; then
+          echo "✅ Container Scan: Passed" >> security-summary.md
+        else
+          echo "❌ Container Scan: Failed" >> security-summary.md
+        fi
+        
+        if [ "${{ needs.secrets-scan.result }}" == "success" ]; then
+          echo "✅ Secrets Scan: Passed" >> security-summary.md
+        else
+          echo "❌ Secrets Scan: Failed" >> security-summary.md
+        fi
+        
+        if [ "${{ needs.license-check.result }}" == "success" ]; then
+          echo "✅ License Check: Passed" >> security-summary.md
+        else
+          echo "❌ License Check: Failed" >> security-summary.md
+        fi
+        
+        echo "" >> security-summary.md
+        echo "Generated on: $(date)" >> security-summary.md
+        
+        cat security-summary.md
+    
+    - name: Upload security summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-summary
+        path: security-summary.md

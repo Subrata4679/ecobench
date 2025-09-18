@@ -1,0 +1,232 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+      packages: write
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Get version from tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Generate changelog from git commits
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+        if [ -n "$PREVIOUS_TAG" ]; then
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD)
+        else
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" HEAD)
+        fi
+        
+        # Save changelog to file
+        echo "## Changes" > changelog.md
+        echo "$CHANGELOG" >> changelog.md
+        
+        # Set output for use in release
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        cat changelog.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        release_name: EcoBench ${{ steps.version.outputs.version }}
+        body: |
+          # EcoBench Release ${{ steps.version.outputs.version }}
+          
+          Enterprise-grade ESG benchmarking platform with AI-powered insights.
+          
+          ${{ steps.changelog.outputs.changelog }}
+          
+          ## Docker Images
+          
+          - Backend: `ghcr.io/${{ github.repository }}-backend:${{ steps.version.outputs.version }}`
+          - Frontend: `ghcr.io/${{ github.repository }}-frontend:${{ steps.version.outputs.version }}`
+          
+          ## Installation
+          
+          ```bash
+          # Clone the repository
+          git clone https://github.com/${{ github.repository }}.git
+          cd $(basename ${{ github.repository }})
+          
+          # Checkout this release
+          git checkout ${{ steps.version.outputs.version }}
+          
+          # Start with Docker Compose
+          docker-compose up -d
+          ```
+          
+          ## Documentation
+          
+          - [API Documentation](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.version }}/README.md)
+          - [Deployment Guide](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.version }}/docs/deployment.md)
+        draft: false
+        prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}
+
+  build-release-images:
+    name: Build Release Images
+    runs-on: ubuntu-latest
+    needs: [create-release]
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}
+        tags: |
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+    
+    - name: Build and push image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.component }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          VERSION=${{ needs.create-release.outputs.version }}
+          ${{ matrix.component == 'frontend' && 'REACT_APP_API_URL=http://localhost:8000' || '' }}
+
+  generate-sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [create-release]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Generate Backend SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        path: ./backend
+        format: spdx-json
+        output-file: backend-sbom.spdx.json
+    
+    - name: Generate Frontend SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        path: ./frontend
+        format: spdx-json
+        output-file: frontend-sbom.spdx.json
+    
+    - name: Upload Backend SBOM
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: backend-sbom.spdx.json
+        asset_name: backend-sbom.spdx.json
+        asset_content_type: application/json
+    
+    - name: Upload Frontend SBOM
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: frontend-sbom.spdx.json
+        asset_name: frontend-sbom.spdx.json
+        asset_content_type: application/json
+
+  security-scan-release:
+    name: Security Scan Release
+    runs-on: ubuntu-latest
+    needs: [build-release-images]
+    
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.component }}:${{ needs.create-release.outputs.version }}
+        format: 'sarif'
+        output: 'trivy-${{ matrix.component }}-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-${{ matrix.component }}-results.sarif'
+
+  notify-release:
+    name: Notify Release
+    runs-on: ubuntu-latest
+    needs: [create-release, build-release-images, generate-sbom]
+    if: always()
+    
+    steps:
+    - name: Notify success
+      if: ${{ needs.create-release.result == 'success' && needs.build-release-images.result == 'success' }}
+      run: |
+        echo "🎉 Release ${{ needs.create-release.outputs.version }} created successfully!"
+        echo "Docker images have been built and pushed to the registry."
+        echo "SBOM files have been generated and attached to the release."
+    
+    - name: Notify failure
+      if: ${{ needs.create-release.result == 'failure' || needs.build-release-images.result == 'failure' }}
+      run: |
+        echo "🚨 Release ${{ needs.create-release.outputs.version }} failed!"
+        echo "Please check the workflow logs for details."
