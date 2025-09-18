@@ -38,4 +38,4 @@ requests==2.31.0
 lxml==4.9.3
 scrapy==2.11.0
 feedparser==6.0.10
-schedule==1.2.0
+schedule==1.2.2
